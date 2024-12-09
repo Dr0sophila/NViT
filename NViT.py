@@ -1,8 +1,5 @@
 import torch
 from torch import nn
-from einops import rearrange, repeat
-from einops.layers.torch import Rearrange
-
 
 class FeedForward(nn.Module):
     def __init__(self, dim, hidden_dim, dropout=0.):
@@ -18,7 +15,6 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         return self.net(x)
-
 
 class Attention(nn.Module):
     def __init__(self, dim, heads=8, dim_head=64, dropout=0.):
@@ -43,7 +39,7 @@ class Attention(nn.Module):
     def forward(self, x):
         x = self.norm(x)
         qkv = self.to_qkv(x).chunk(3, dim=-1)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=self.heads), qkv)
+        q, k, v = map(lambda t: t.view(t.shape[0], t.shape[1], self.heads, -1).transpose(1, 2), qkv)
 
         dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
 
@@ -51,9 +47,8 @@ class Attention(nn.Module):
         attn = self.dropout(attn)
 
         out = torch.matmul(attn, v)
-        out = rearrange(out, 'b h n d -> b n (h d)')
+        out = out.transpose(1, 2).reshape(out.shape[0], out.shape[2], -1)
         return self.to_out(out)
-
 
 class Transformer(nn.Module):
     def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout=0.):
@@ -70,7 +65,6 @@ class Transformer(nn.Module):
             x = attn(x) + x
             x = ff(x) + x
         return x
-
 
 class NViT(nn.Module):
     """
@@ -90,10 +84,11 @@ class NViT(nn.Module):
 
         assert pool in {'cls', 'mean'}, 'pool type must be either cls (cls token) or mean (mean pooling)'
 
+        self.patch_size = patch_size
+        self.num_patches = num_patches
+        self.dim = dim
+
         self.to_patch_embedding = nn.Sequential(
-            Rearrange('b c ' + ' '.join([f'(d{i} p{i})' for i in range(len(input_size))]) +
-                      ' -> b (p0 p1 ... pn) (c ' + ' '.join([f'p{i}' for i in range(len(input_size))]) + ')',
-                      **{f'p{i}': patch_size[i] for i in range(len(input_size))}),
             nn.LayerNorm(patch_dim),
             nn.Linear(patch_dim, dim),
             nn.LayerNorm(dim),
@@ -114,10 +109,22 @@ class NViT(nn.Module):
         )
 
     def forward(self, x):
-        x = self.to_patch_embedding(x)
+        b, c, *spatial_dims = x.shape
+        patch_size = self.patch_size.tolist()
+
+        # Rearrange input to patches using unfold
+        patches = x.unfold(2, patch_size[0], patch_size[0])
+        for i in range(1, len(spatial_dims)):
+            patches = patches.unfold(i + 2, patch_size[i], patch_size[i])
+
+        # Merge patches and channels
+        patches = patches.contiguous().view(b, c, -1, torch.prod(torch.tensor(patch_size)).item())
+        patches = patches.permute(0, 2, 3, 1).contiguous().view(b, -1, c * torch.prod(torch.tensor(patch_size)).item())
+
+        x = self.to_patch_embedding(patches)
         b, n, _ = x.shape
 
-        cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b=b)
+        cls_tokens = self.cls_token.expand(b, -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
         x += self.pos_embedding[:, :(n + 1)]
         x = self.dropout(x)
